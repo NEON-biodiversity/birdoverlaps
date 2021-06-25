@@ -1,0 +1,142 @@
+---
+title: "Bird overlaps"
+author: "Quentin D. Read"
+date: "6/25/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Ben was interested in figuring out why the O-stat for some communities in his bird body size dataset was very close to zero when he used the median pairwise overlap, but not when he used the mean pairwise overlap.
+
+To help figure that out, I modified the `community_overlap()` function from the `Ostats` package to also return a data frame with all the individual pairwise overlaps, not just the final summary statistic. That's the function that is run for each community in a loop inside the `Ostats()` function, which itself has a loop that goes through all the species pairs. Eventually, I will incorporate that code into the package so that the user can set an option to also return all the individual values when calculating O-stats. But it's a little extra work to do it in a nice clean way that can go in the package. So I just quickly made a modified version of the function and saved it in this git repo. In this notebook I load the `Ostats` package then load the modified version of the function from a script.
+
+In the following, I:
+
+- got the individual pairwise overlaps for the three bird banding stations and plotted their distributions
+- experimented with using different bandwidths for the density estimation to see what the consequence would be for the O-stats
+
+## Load data
+
+Here I load the data and subset (copied from Ben's code) then I source the script with the modified function.
+
+```{r load everything, message = FALSE}
+library(dplyr)
+library(purrr)
+library(Ostats)
+
+bird_data<-read.csv("~/Documents/temp/ben_birds_forQ.csv")
+
+#these are the locations that were in the plot. specifically VINS Iis the one that is curious
+sub_station<-c("VINS","PATT","FTGI")
+
+dat_in <- bird_data %>%
+  filter(STATION %in% sub_station)%>% 
+  select(STATION, SPEC, WEIGHT) %>%
+  filter(!is.na(WEIGHT)) %>%
+  mutate(log_WEIGHT = log10(WEIGHT))
+
+# Load the modified community_overlap function that returns raw values too
+source('community_overlap_modified.R')
+```
+
+## Get individual pairwise overlaps
+
+Now do the community overlap for each site, using the modified function that also returns the raw list.
+
+```{r}
+raw_overlap_list <- dat_in %>%
+  group_by(STATION) %>%
+  group_map(~ community_overlap(traits = as.matrix(.[, 'log_WEIGHT']), sp = factor(.$SPEC), normal = TRUE, output = 'median'))
+```
+
+We have a list of 3 lists (one for each site). Each site has an element `raw` which is a dataframe with the raw overlaps.
+Combine them into a single dataframe.
+
+```{r}
+raw_overlap_df <- map2_dfr(sub_station, raw_overlap_list, ~ data.frame(STATION = .x, .y[['raw']]))
+```
+
+Write output to CSV (not run in notebook).
+
+```{r, eval = FALSE}
+write.csv(raw_overlap_df, 'bird3stationoverlaps.csv', row.names = FALSE)
+```
+
+## Look at individual pairwise overlaps
+
+Let's take a look at the distribution of overlaps by site.
+
+```{r, message = FALSE}
+library(ggplot2)
+
+ggplot(raw_overlap_df, aes(x = overlap)) +
+  geom_histogram() +
+  facet_wrap(~ STATION) +
+  theme_bw() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.01)))
+```
+
+Look at the proportion, by site, of overlaps that are less than `1e-5`.
+
+```{r}
+# Proportion very close to zero overlaps, by site
+raw_overlap_df %>%
+  group_by(STATION) %>%
+  summarize(n_verysmall = sum(overlap < 1e-5),
+            n_notsmall = sum(overlap > 1e-5),
+            proportion_verysmall = n_verysmall/(n_verysmall+n_notsmall)) %>%
+  knitr::kable()
+```
+
+## Different kernel bandwidths: example
+
+After a while, I thought maybe we could experiment with different bandwidths. Density functions for a particular dataset are dependent on the bandwidth you choose. The smaller the bandwidth, the tighter the fit of the function to the data. So if bandwidth approaches zero, the peaks of the individual species' distributions get skinnier and skinnier and overlap will also approach zero. If bandwidth is a very big number, the distributions will get wider and wider and overlap will approach 1. 
+
+To get a sensible overlap, bandwidth must be done in a consistent way for all species and sites. For our original O-stats, we chose to use the default bandwidth from the R function `density()` which is estimated by an algorithm called `nrd0` that I don't know anything about. But you can also set a fixed bandwidth.
+
+Here is an example with one random species I took out of the dataset, Carolina chickadee at one of the stations.
+
+```{r}
+chickadee <- filter(dat_in, SPEC == 'CACH', STATION == 'FTGI')
+
+chick_dens <- map(list('nrd0', 0.01, 0.05, 0.10), ~ density(chickadee[, 'log_WEIGHT'], bw = .))
+
+# Plot the densities
+chick_dens_df <- map_dfr(chick_dens, ~ data.frame(bw = .[['bw']], x = .[['x']], y = .[['y']]))
+ggplot(chick_dens_df, aes(x = x, y = y, color = factor(bw), group = factor(bw))) +
+  geom_line(size = 1) +
+  theme_bw() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.01)))
+```
+
+From the plot you can see that the default bandwidth ends up being about 0.028 and that the low bandwidth makes a really peaky distribution, which gets wider as bandwidth goes up.
+
+## Different kernel bandwidths: try out on the 3 sites
+
+I use the default bandwidth, and three other values, to get the pairwise overlaps for all three sites, and use the median to get the community-level O-stat.
+
+```{r}
+raw_overlap_list_bandwidths <- map(list('nrd0', 0.01, 0.05, 0.10), function(bandwidth) dat_in %>%
+                                     group_by(STATION) %>%
+                                     group_map(~ community_overlap(traits = as.matrix(.[, 'log_WEIGHT']), sp = factor(.$SPEC), normal = TRUE, output = 'median', density_args = list(bw = bandwidth)))
+)
+```
+
+Here is a table of the results. As you can see setting a fixed bandwidth at a reasonable number like 0.05 is maybe good in this case because it shows good separation between the sites without any of them being close to zero.
+
+```{r, echo = FALSE}
+# Extract the values and look at them in a table.
+ostats_list <- map(raw_overlap_list_bandwidths, ~ do.call(rbind, map(., "value")))
+ostats_table <- data.frame(Station = sub_station, ostats_list)
+names(ostats_table) <- c('Station', 'bw = default', 'bw = 0.01', 'bw = 0.05', 'bw = 0.10')
+
+# Replace very small values with a string and make a table
+ostats_table %>%
+  mutate(across(where(is.numeric), function(x) ifelse(x < 1e-6, "< 1e-6", round(x, 3)))) %>%
+  knitr::kable()
+```
+
+You can apply this to your O-stats calculation by setting `density_args = list(bw = x)` in your call to `Ostats()`, where `x` is whatever number. In the end I might recommend doing it with different bandwidths and seeing if the final answer to whatever research question you have is strongly affected by your choices of bandwidth.
